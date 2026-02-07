@@ -209,9 +209,7 @@ await pool.query(
 );
 
 return res.json({ ok: true, loginToken: rawLoginToken });
-      loginUrl: `${process.env.APP_URL}/?logged=1`,
-    });
-  } catch (e) {
+} catch (e) {
     console.error("provision error:", e?.message || e);
     return res.status(500).json({ error: e?.message || "provision_failed" });
   }
