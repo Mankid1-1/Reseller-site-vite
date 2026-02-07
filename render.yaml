@@ -1,15 +1,14 @@
-services:
+lservices:
   - type: web
     name: reseller-backend
     runtime: node
     plan: free
     region: oregon
 
-    # IMPORTANT: use repo root so pnpm workspace lockfile is respected
-    rootDir: .
+    rootDir: backend
 
     buildCommand: pnpm install --frozen-lockfile
-    startCommand: cd backend && pnpm run start
+    startCommand: pnpm run start
 
     envVars:
       - key: NODE_ENV
