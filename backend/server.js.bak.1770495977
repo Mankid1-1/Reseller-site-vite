@@ -43,48 +43,33 @@ app.post("/webhooks/inbound-sms", async (req, res) => {
       if (!r1.rows.length) { await client.query("rollback"); return res.json({ ok: true, no_match: true }); }
 
       const { waitlist_id, tenant_id, customer_id, status } = r1.rows[0];
-
-      // If waitlist isn\x27t contacted, only block if a future appt already exists.
-      if (status !== "contacted") {
-        const ex = await client.query(`
-          select id, status
-          from appointments
-          where tenant_id=$1
-            and customer_id=$2
-            and status in (\x27booked\x27,\x27confirmed\x27)
-            and start_ts > now()
-          order by start_ts asc
-          limit 1
-        `, [tenant_id, customer_id]);
-        if (ex.rows.length) { await client.query("rollback"); return res.json({ ok:true, already:true, status: ex.rows[0].status, appointment_id: ex.rows[0].id }); }
-        await client.query("update waitlist_entries set status=\x27contacted\x27 where id=$1", [waitlist_id]);
-      }
+      if (status !== "contacted") { await client.query("rollback"); return res.json({ ok: true, already: true, status }); }
 
       const upd = await client.query(
-        "update waitlist_entries set status=\x27booked\x27 where id=$1 and status=\x27contacted\x27",
+        "update waitlist_entries set status='booked' where id=$1 and status='contacted'",
         [waitlist_id]
       );
       if (upd.rowCount !== 1) { await client.query("rollback"); return res.json({ ok: true, already: true }); }
 
       const q2 = `
         insert into appointments(tenant_id, customer_id, start_ts, end_ts, status)
-        values ($1, $2, now(), now() + interval \x271 hour\x27, \x27booked\x27)
+        values ($1, $2, now(), now() + interval '1 hour', 'booked')
         returning id
       `;
       const r2 = await client.query(q2, [tenant_id, customer_id]);
       const appointment_id = r2.rows[0].id;
 
+      // idempotent recovered_booking per appointment_id
       const q3 = `
         insert into revenue_events(tenant_id, type, amount_cents, appointment_id)
-    select , 'recovered_booking', coalesce(a.service_price_cents, 5000), 
-    from appointments a
-    where a.id=
-    on conflict do nothing
-`;
+        values ($1, 'recovered_booking', 5000, $2)
+        on conflict do nothing
+      `;
       await client.query(q3, [tenant_id, appointment_id]);
 
       await client.query(
-        "insert into messages(tenant_id, channel, \"to\", body, status) values ($1, \x27sms\x27, $2, \x27Booked. See you soon!\x27, \x27queued\x27)",
+        `insert into messages(tenant_id, channel, "to", body, status)
+         values ($1, 'sms', $2, 'Booked. See you soon!', 'queued')`,
         [tenant_id, from]
       );
 
@@ -466,5 +451,3 @@ app.post("/sms/send", async (req, res) => {
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
-
-

@@ -1,0 +1,256 @@
+import 'dotenv/config';
+import pg from 'pg';
+
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('sslmode=require') ? { rejectUnauthorized: false } : undefined,
+});
+
+const WORKER_ID = process.env.WORKER_ID || `termux-${process.pid}`;
+const POLL_MS = Number(process.env.JOB_POLL_MS || 1000);
+const BATCH = Number(process.env.JOB_BATCH || 10);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function claimJobs(client) {
+  const q = `
+    with cte as (
+      select id
+      from jobs
+      where status = 'queued'
+        and run_at <= now()
+      order by run_at asc
+      for update skip locked
+      limit $1
+    )
+    update jobs j
+    set status='running', locked_at=now(), locked_by=$2, attempts = attempts + 1
+    from cte
+    where j.id = cte.id
+    returning j.*;
+  `;
+  const { rows } = await client.query(q, [BATCH, WORKER_ID]);
+  return rows;
+}
+
+async function upsertAttempt(client, jobId, attemptNo, status, error = null) {
+  if (status === 'started') {
+    await client.query(
+      `insert into job_attempts(job_id, attempt_no, status) values ($1,$2,'started')`,
+      [jobId, attemptNo]
+    );
+    return;
+  }
+  await client.query(
+    `update job_attempts
+     set status=$3, error=$4, finished_at=now()
+     where job_id=$1 and attempt_no=$2 and status='started'`,
+    [jobId, attemptNo, status, error]
+  );
+}
+
+async function succeedJob(client, jobId) {
+  await client.query(`update jobs set status='succeeded', last_error=null where id=$1`, [jobId]);
+}
+
+async function failJob(client, jobId, err) {
+  const { rows } = await client.query(`select attempts from jobs where id=$1`, [jobId]);
+  const attempts = rows[0]?.attempts ?? 1;
+  const dead = attempts >= 5;
+
+  const backoffSeconds = Math.min(60 * 30, Math.pow(2, attempts) * 5);
+  await client.query(
+    `update jobs
+     set status=$2,
+         last_error=$3,
+         run_at = case when $2='queued' then now() + ($4 || ' seconds')::interval else run_at end
+     where id=$1`,
+    [jobId, dead ? 'dead' : 'queued', String(err?.stack || err), String(backoffSeconds)]
+  );
+}
+
+async function handleGapFill(client, job) {
+  const p = job.payload || {};
+  const tenantId = job.tenant_id;
+
+  const { rows: candidates } = await client.query(
+    `
+    select w.*, c.phone, c.email, c.full_name
+    from waitlist_entries w
+    left join customers c on c.id = w.customer_id
+    where w.tenant_id = $1
+      and w.status = 'active'
+      and (w.earliest_ts is null or w.earliest_ts <= $2::timestamptz)
+      and (w.latest_ts is null or w.latest_ts >= $3::timestamptz)
+      and ($4::uuid is null or w.desired_service_id = $4::uuid)
+    order by w.priority_score desc, w.created_at asc
+    limit 5
+    `,
+    [tenantId, p.gap_start, p.gap_end, p.service_id || null]
+  );
+
+  if (!candidates.length) return;
+
+  const top = candidates[0];
+  await client.query(`update waitlist_entries set status='contacted' where id=$1`, [top.id]);
+
+  const body = `A slot opened up. Reply YES to book. Window: ${p.gap_start} - ${p.gap_end}`;
+  if (top.phone) {
+    await client.query(
+      `insert into messages(tenant_id, channel, "to", body, status) values ($1,'sms',$2,$3,'queued')`,
+      [tenantId, top.phone, body]
+    );
+  } else if (top.email) {
+    await client.query(
+      `insert into messages(tenant_id, channel, "to", body, status) values ($1,'email',$2,$3,'queued')`,
+      [tenantId, top.email, body]
+    );
+  }
+}
+
+async function handleJob(client, job) {
+  switch (job.type) {
+    case 'gap_fill':
+      return handleGapFill(client, job);
+    default:
+      return;
+  }
+}
+
+async function loop() {
+  while (true) {
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      const jobs = await claimJobs(client);
+
+      for (const job of jobs) {
+        const attemptNo = job.attempts;
+        await upsertAttempt(client, job.id, attemptNo, 'started');
+        try {
+          await handleJob(client, job);
+          await succeedJob(client, job.id);
+          await upsertAttempt(client, job.id, attemptNo, 'succeeded');
+        } catch (e) {
+          await upsertAttempt(client, job.id, attemptNo, 'failed', String(e?.stack || e));
+          await failJob(client, job.id, e);
+        }
+      }
+
+      await client.query('commit');
+    } catch {
+      try { await client.query('rollback'); } catch {}
+    } finally {
+      client.release();
+    }
+    await sleep(POLL_MS);
+  }
+}
+
+loop().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+import http from "node:http";
+
+function httpJson(url, method, payload) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(payload || {}));
+    const u = new URL(url);
+    const opts = {
+      method,
+      hostname: u.hostname,
+      port: u.port || 80,
+      path: u.pathname + u.search,
+      headers: {
+        "content-type": "application/json",
+        "content-length": data.length,
+      },
+    };
+    const req = http.request(opts, (res) => {
+      let buf = "";
+      res.on("data", (c) => (buf += c));
+      res.on("end", () => {
+        try {
+          const out = buf ? JSON.parse(buf) : {};
+          resolve({ status: res.statusCode, json: out });
+        } catch {
+          resolve({ status: res.statusCode, json: { raw: buf } });
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+async function processNoShowsOnce() {
+  const q = `
+    select id, tenant_id, client_phone
+    from appointments
+    where no_show_processed=false
+      and status in ('booked','confirmed')
+      and end_ts < (now() - interval '15 minutes')
+      and client_phone is not null
+    order by end_ts asc
+    limit 50
+  `;
+  const { rows } = await pool.query(q);
+
+  if (!rows.length) return;
+
+  const base = process.env.BACKEND_BASE_URL || "http://127.0.0.1:8787";
+  for (const a of rows) {
+    // 1) Ensure customer exists for (tenant, phone)
+    const c = await pool.query(
+      `insert into customers(tenant_id, phone)
+       values ($1, $2)
+       on conflict (tenant_id, phone) where phone is not null
+       do update set phone = excluded.phone
+       returning id`,
+      [a.tenant_id, a.client_phone]
+    );
+    const customerId = c.rows[0]?.id;
+
+    // 2) Ensure a single contacted waitlist entry exists (tenant, customer)
+    // (unique partial index ux_waitlist_contacted enforces no duplicates)
+    let waitlistId = null;
+    if (customerId) {
+      const w = await pool.query(
+        `insert into waitlist_entries(tenant_id, customer_id, status)
+         values ($1, $2, 'contacted')
+         on conflict (tenant_id, customer_id) where status='contacted'
+         do update set status='contacted'
+         returning id`,
+        [a.tenant_id, customerId]
+      );
+      waitlistId = w.rows[0]?.id;
+    }
+
+    // 3) Send SMS
+    const body =
+      "You missed your appointment today. Reply YES to grab the next open slot automatically.";
+    const r = await httpJson(base + "/sms/send", "POST", {
+      tenant_id: a.tenant_id,
+      to: a.client_phone,
+      body,
+    });
+
+    // 4) Mark processed (idempotent)
+    await pool.query(`update appointments set no_show_processed=true where id=$1`, [a.id]);
+
+    console.log("[NOSHOW]", { appt: a.id, sms_status: r.status, customerId, waitlistId });
+  }
+
+}
+
+// ---- No-show loop runner ----
+const NOSHOW_INTERVAL_MS = Number(process.env.NOSHOW_INTERVAL_MS || 60000); // 60s
+setInterval(() => {
+  processNoShowsOnce().catch((e) =>
+    console.error("NOSHOW_LOOP_ERR:", e && (e.stack || e))
+  );
+}, NOSHOW_INTERVAL_MS);
