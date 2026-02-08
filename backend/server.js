@@ -76,11 +76,9 @@ app.post("/webhooks/inbound-sms", async (req, res) => {
 
       const q3 = `
         insert into revenue_events(tenant_id, type, amount_cents, appointment_id)
-    select , 'recovered_booking', coalesce(a.service_price_cents, 5000), 
-    from appointments a
-    where a.id=
-    on conflict do nothing
-`;
+        values ($1, 'recovered_booking', 5000, $2)
+        on conflict do nothing
+      `;
       await client.query(q3, [tenant_id, appointment_id]);
 
       await client.query(
